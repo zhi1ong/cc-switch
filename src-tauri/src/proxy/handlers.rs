@@ -523,7 +523,7 @@ async fn handle_claude_transform(
             connection_guard,
         );
 
-        // 响应模型回写（本地定制，默认关闭）：usage 收集已基于原始模型名完成
+        // 响应模型回写（整流器子开关，默认关闭）：usage 收集已基于原始模型名完成
         let final_stream = super::response_model_rewriter::wrap_stream_for_model_rewrite(
             logged_stream,
             ctx.response_model_rewrite_target(),
@@ -682,7 +682,7 @@ async fn handle_claude_transform(
     // 在上游缺 stream_options.include_usage 时没有 usage，写入只会产生无意义空行
     spawn_claude_usage_log(state, ctx, &anthropic_response, status.as_u16(), false);
 
-    // 响应模型回写（本地定制，默认关闭）：usage 记账已基于原始模型名完成
+    // 响应模型回写（整流器子开关，默认关闭）：usage 记账已基于原始模型名完成
     let mut anthropic_response = anthropic_response;
     if let Some(target) = ctx.response_model_rewrite_target() {
         super::response_model_rewriter::rewrite_value_model(&mut anthropic_response, &target);
@@ -1218,6 +1218,13 @@ async fn handle_codex_xai_native_responses_rewrite(
         let mut response_headers = response.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
 
+        // 响应模型回写（整流器子开关，默认关闭）。回写改变 SSE 字节数，
+        // 上游若带 Content-Length 需要剥掉，避免下游按旧长度截断。
+        let rewrite_target = ctx.response_model_rewrite_target();
+        if rewrite_target.is_some() {
+            strip_entity_headers_for_rebuilt_body(&mut response_headers);
+        }
+
         let mut builder = axum::response::Response::builder().status(status);
         for (key, value) in &response_headers {
             builder = builder.header(key, value);
@@ -1238,10 +1245,9 @@ async fn handle_codex_xai_native_responses_rewrite(
             connection_guard,
         );
 
-        // 响应模型回写（本地定制，默认关闭）
         let final_stream = super::response_model_rewriter::wrap_stream_for_model_rewrite(
             logged_stream,
-            ctx.response_model_rewrite_target(),
+            rewrite_target,
         );
 
         let body = axum::body::Body::from_stream(final_stream);
@@ -1316,7 +1322,7 @@ async fn handle_codex_xai_native_responses_rewrite(
                     }
                 });
             }
-            // 响应模型回写（本地定制，默认关闭）：usage 记账已在上方基于
+            // 响应模型回写（整流器子开关，默认关闭）：usage 记账已在上方基于
             // 原始 value 完成，这里只影响发给客户端的字节。
             if let Some(target) = ctx.response_model_rewrite_target() {
                 super::response_model_rewriter::rewrite_value_model(&mut value, &target);
@@ -1445,7 +1451,7 @@ async fn handle_codex_chat_to_responses_transform(
             connection_guard,
         );
 
-        // 响应模型回写（本地定制，默认关闭）：usage 收集已基于原始模型名完成
+        // 响应模型回写（整流器子开关，默认关闭）：usage 收集已基于原始模型名完成
         let final_stream = super::response_model_rewriter::wrap_stream_for_model_rewrite(
             logged_stream,
             ctx.response_model_rewrite_target(),
@@ -1561,7 +1567,7 @@ async fn handle_codex_chat_to_responses_transform(
         });
     }
 
-    // 响应模型回写（本地定制，默认关闭）：usage 记账已基于原始模型名完成
+    // 响应模型回写（整流器子开关，默认关闭）：usage 记账已基于原始模型名完成
     if let Some(target) = ctx.response_model_rewrite_target() {
         super::response_model_rewriter::rewrite_value_model(&mut responses_response, &target);
     }
@@ -1731,7 +1737,7 @@ async fn handle_codex_anthropic_to_responses_transform(
         });
     }
 
-    // 响应模型回写（本地定制，默认关闭）：usage 记账已基于原始模型名完成
+    // 响应模型回写（整流器子开关，默认关闭）：usage 记账已基于原始模型名完成
     if let Some(target) = ctx.response_model_rewrite_target() {
         super::response_model_rewriter::rewrite_value_model(&mut responses_response, &target);
     }
@@ -1834,7 +1840,7 @@ fn build_codex_anthropic_sse_response(
         connection_guard,
     );
 
-    // 响应模型回写（本地定制，默认关闭）：usage 收集已基于原始模型名完成
+    // 响应模型回写（整流器子开关，默认关闭）：usage 收集已基于原始模型名完成
     let final_stream = super::response_model_rewriter::wrap_stream_for_model_rewrite(
         logged_stream,
         ctx.response_model_rewrite_target(),

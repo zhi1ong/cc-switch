@@ -403,7 +403,7 @@ mod tests {
         );
         assert!(
             !config.response_model_rewrite,
-            "响应模型回写默认应为 false（本地定制，按需开启）"
+            "响应模型回写默认应为 false（opt-in，按需开启）"
         );
     }
 
