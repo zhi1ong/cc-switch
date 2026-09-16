@@ -199,7 +199,14 @@ pub async fn handle_streaming(
         connection_guard,
     );
 
-    let body = axum::body::Body::from_stream(logged_stream);
+    // 响应模型回写（本地定制，默认关闭）：usage 收集器在 logged_stream 内部
+    // 看到的仍是上游回显的真实模型名，回写只影响发给客户端的字节。
+    let final_stream = super::response_model_rewriter::wrap_stream_for_model_rewrite(
+        logged_stream,
+        ctx.response_model_rewrite_target(),
+    );
+
+    let body = axum::body::Body::from_stream(final_stream);
     match builder.body(body) {
         Ok(resp) => resp,
         Err(e) => {
@@ -306,6 +313,23 @@ pub async fn handle_non_streaming(
     } else {
         log::debug!("[{}] usage logging 已关闭，跳过非流式 usage 解析", ctx.tag);
     }
+
+    // 响应模型回写（本地定制，默认关闭）：usage 记账已在上方基于原始字节
+    // 完成，这里只改写发给客户端的副本。body 被改写后原 content-length 等
+    // 实体头失真，需要剥掉由 axum 按新 body 重新生成。
+    let body_bytes = match ctx.response_model_rewrite_target() {
+        Some(target) => {
+            match super::response_model_rewriter::rewrite_json_body_model(&body_bytes, &target) {
+                Some(rewritten) => {
+                    log::debug!("[{}] 响应模型回写: → {target}（非流式）", ctx.tag);
+                    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+                    Bytes::from(rewritten)
+                }
+                None => body_bytes,
+            }
+        }
+        None => body_bytes,
+    };
 
     // 构建响应
     let mut builder = axum::response::Response::builder().status(status);
