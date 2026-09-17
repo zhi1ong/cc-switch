@@ -178,16 +178,15 @@ pub async fn handle_streaming(
     let mut response_headers = response.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
 
-    // 响应模型回写（整流器子开关，默认关闭）。两点防御：
-    // - 压缩 SSE（上游无视 accept-encoding: identity）时跳过回写，保持原始字节
-    //   透传——文本改写会把压缩字节转成 U+FFFD 替换字符，造成不可逆损坏；
+    // 响应模型回写和 tool ID 冲突改写共用两点防御：
+    // - 压缩 SSE（上游无视 accept-encoding: identity）时跳过两种改写，保持
+    //   原始字节与 content-encoding，避免把压缩响应当作明文 SSE 处理；
     // - 回写会改变 SSE 字节数，带 Content-Length 的整包 SSE 会被下游按旧长度
     //   截断/挂起，因此剥掉实体头让 axum 按流式重生成。
-    // tool ID 冲突改写同样会改变 SSE 字节数，实体头一并处理。
-    let rewrite_target = if get_content_encoding(response.headers()).is_none() {
-        ctx.response_model_rewrite_target()
+    let (rewrite_target, tool_id_rewriter) = if get_content_encoding(response.headers()).is_none() {
+        (ctx.response_model_rewrite_target(), tool_id_rewriter)
     } else {
-        None
+        (None, None)
     };
     if rewrite_target.is_some() || tool_id_rewriter.is_some() {
         strip_entity_headers_for_rebuilt_body(&mut response_headers);
@@ -1212,6 +1211,137 @@ mod tests {
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }
+    }
+
+    async fn streaming_test_context() -> (ProxyState, RequestContext) {
+        let db = Arc::new(Database::memory().unwrap());
+        let app_type = crate::app_config::AppType::Claude;
+        // 沿用设备当前 ID，避免 RequestContext 在测试数据库中找不到该 ID 时
+        // 清理本地 settings。供应商数据和路由状态都只存在于内存数据库。
+        let provider_id = crate::settings::get_current_provider(&app_type)
+            .unwrap_or_else(|| "streaming-test-provider".to_string());
+        insert_provider(&db, &provider_id, "claude", ProviderMeta::default()).unwrap();
+        db.set_current_provider("claude", &provider_id).unwrap();
+        let state = build_state(db);
+        state.config.write().await.enable_logging = false;
+        let ctx = RequestContext::new(
+            &state,
+            &serde_json::json!({"model": "requested-model", "stream": true}),
+            &HeaderMap::new(),
+            app_type,
+            "test",
+            "claude",
+        )
+        .await
+        .unwrap();
+        (state, ctx)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn streaming_rewriters_preserve_compressed_headers_and_chunks() {
+        use http_body_util::BodyExt;
+
+        let (state, mut ctx) = streaming_test_context().await;
+        let raw = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, raw).unwrap();
+        let compressed = Bytes::from(encoder.finish().unwrap());
+        let chunks = vec![compressed.slice(..8), compressed.slice(8..)];
+
+        for model_rewrite in [false, true] {
+            for tool_compat in [false, true] {
+                ctx.rectifier_config.enabled = true;
+                ctx.rectifier_config.response_model_rewrite = model_rewrite;
+                ctx.rectifier_config.response_tool_id_compat = tool_compat;
+                let mut headers = HeaderMap::new();
+                headers.insert("content-type", "text/event-stream".parse().unwrap());
+                headers.insert("content-encoding", "gzip".parse().unwrap());
+                headers.insert(
+                    "content-length",
+                    compressed.len().to_string().parse().unwrap(),
+                );
+                let upstream = ProxyResponse::streamed(
+                    http::StatusCode::OK,
+                    headers.clone(),
+                    futures::stream::iter(chunks.clone().into_iter().map(Ok)),
+                );
+                let rewriter =
+                    tool_compat.then(|| ToolIdRewriter::from_request(&serde_json::json!({})));
+                let response = handle_streaming(
+                    upstream,
+                    &ctx,
+                    &state,
+                    &super::super::handler_config::CLAUDE_PARSER_CONFIG,
+                    None,
+                    rewriter,
+                )
+                .await;
+                assert_eq!(response.headers(), &headers);
+                let mut body = response.into_body();
+                for chunk in &chunks {
+                    let actual = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                    assert_eq!(
+                        &actual, chunk,
+                        "compressed chunks must pass through without buffering"
+                    );
+                }
+                assert!(body.frame().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn streaming_tool_and_model_rewriters_strip_stale_length() {
+        let (state, mut ctx) = streaming_test_context().await;
+        ctx.rectifier_config.enabled = true;
+        ctx.rectifier_config.response_model_rewrite = true;
+        ctx.rectifier_config.response_tool_id_compat = true;
+        let history = serde_json::json!({"messages": [{"content": [{
+            "type": "tool_result", "tool_use_id": "toolu_Bash_0", "content": "done"
+        }]}]});
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"upstream-model\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\n",
+            "data: \"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_Bash_0\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        headers.insert("content-length", raw.len().to_string().parse().unwrap());
+        let upstream = ProxyResponse::buffered(
+            http::StatusCode::OK,
+            headers,
+            Bytes::from_static(raw.as_bytes()),
+        );
+        let response = handle_streaming(
+            upstream,
+            &ctx,
+            &state,
+            &super::super::handler_config::CLAUDE_PARSER_CONFIG,
+            None,
+            Some(ToolIdRewriter::from_request(&history)),
+        )
+        .await;
+        assert!(!response.headers().contains_key("content-length"));
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let mut decoder = SseDecoder::default();
+        decoder.push(bytes);
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(frame) = decoder.next_frame() {
+            if let SseFrame::Event(bytes) = frame {
+                let data = sse_data(std::str::from_utf8(&bytes).unwrap()).unwrap();
+                events.push(serde_json::from_str(&data).unwrap());
+            }
+        }
+        assert!(decoder.finish().is_empty());
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["message"]["model"], "requested-model");
+        let tool_id = events[1]["content_block"]["id"].as_str().unwrap();
+        assert_ne!(tool_id, "toolu_Bash_0");
+        assert!(tool_id.starts_with("toolu_"));
     }
 
     fn seed_pricing(db: &Database) -> Result<(), AppError> {

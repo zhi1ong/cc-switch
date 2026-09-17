@@ -19,7 +19,7 @@
 //! 与 usage 收集、模型回写互不影响。
 
 use super::log_codes;
-use super::sse::{SseDecoder, SseFrame};
+use super::sse::{sse_data, sse_lines, strip_sse_field, SseDecoder, SseFrame};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -133,83 +133,89 @@ impl ToolIdRewriter {
     /// 流式响应改写：单个完整 SSE 事件块中的 `content_block_start`
     /// (tool_use) 冲突 ID 替换为唯一 ID。
     ///
-    /// `block` 是不含结尾定界符（`\n\n` / `\r\n\r\n`）的事件文本。
+    /// `block` 是完整事件文本，允许包含 LF / CRLF / CR 结尾空行。
     /// 未发生冲突时返回 `None`。
     pub(crate) fn rewrite_sse_block(&mut self, block: &str) -> Option<String> {
         if !block.contains("\"tool_use\"") {
             return None;
         }
 
-        // 收集需要替换的 data 行（原文 → 改写后），最后一次性拼回，
-        // 事件行、注释行与其他 data 行保持原样
-        let mut replacements: Vec<(String, String)> = Vec::new();
-        for line in block.lines() {
-            let Some(data) = super::sse::strip_sse_field(line, "data") else {
-                continue;
-            };
-            if data.trim() == "[DONE]" {
-                continue;
-            }
-            let Ok(mut event) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-            if event.get("type").and_then(Value::as_str) != Some("content_block_start") {
-                continue;
-            }
-            let Some(content_block) = event.get("content_block") else {
-                continue;
-            };
-            if content_block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
-            }
-            let Some(id) = content_block
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            // 缺失 index 时无法为重发的 block start 保持身份稳定，跳过
-            let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                continue;
-            };
-
-            let client_id = match self.blocks.get(&index) {
-                Some(assignment) if assignment.original == id => assignment.client.clone(),
-                _ => {
-                    let client = self.unique_id(&id);
-                    self.blocks.insert(
-                        index,
-                        ToolBlockAssignment {
-                            original: id.clone(),
-                            client: client.clone(),
-                        },
-                    );
-                    client
-                }
-            };
-            if client_id == id {
-                continue;
-            }
-
-            if let Some(content_block) = event
-                .get_mut("content_block")
-                .and_then(Value::as_object_mut)
-            {
-                content_block.insert("id".to_string(), Value::String(client_id));
-                if let Ok(new_data) = serde_json::to_string(&event) {
-                    replacements.push((data.to_string(), new_data));
-                }
-            }
-        }
-
-        if replacements.is_empty() {
+        // SSE 的多行 data 共同组成一个 JSON 载荷，必须合并后再解析。
+        let data = sse_data(block)?;
+        let mut event = serde_json::from_str::<Value>(&data).ok()?;
+        if event.get("type").and_then(Value::as_str) != Some("content_block_start") {
             return None;
         }
-        let mut rewritten = block.to_string();
-        for (old, new) in replacements {
-            rewritten = rewritten.replace(&old, &new);
+        let content_block = event.get("content_block")?;
+        if content_block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            return None;
+        }
+        let id = content_block
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())?
+            .to_string();
+        // 缺失 index 时无法为重发的 block start 保持身份稳定，跳过
+        let index = event.get("index").and_then(Value::as_u64)?;
+
+        let client_id = match self.blocks.get(&index) {
+            Some(assignment) if assignment.original == id => assignment.client.clone(),
+            _ => {
+                let client = self.unique_id(&id);
+                self.blocks.insert(
+                    index,
+                    ToolBlockAssignment {
+                        original: id.clone(),
+                        client: client.clone(),
+                    },
+                );
+                client
+            }
+        };
+        if client_id == id {
+            return None;
+        }
+
+        event
+            .get_mut("content_block")?
+            .as_object_mut()?
+            .insert("id".to_string(), Value::String(client_id));
+        let serialized = serde_json::to_string(&event).ok()?;
+
+        // 只替换 data 字段，保留事件名、ID、注释和 BOM。把合并后的载荷放在
+        // 最后一个 data 行，保留其结尾，避免混合 CR/LF 在删行后合成 CRLF。
+        let mut remaining_data = sse_lines(block)
+            .enumerate()
+            .filter(|(index, (line, _))| {
+                let field = if *index == 0 {
+                    line.strip_prefix('\u{feff}').unwrap_or(line)
+                } else {
+                    line
+                };
+                strip_sse_field(field, "data").is_some()
+            })
+            .count();
+        let mut rewritten = String::with_capacity(block.len());
+        for (index, (line, ending)) in sse_lines(block).enumerate() {
+            let field = if index == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(line)
+            } else {
+                line
+            };
+            if strip_sse_field(field, "data").is_some() {
+                if field.len() != line.len() {
+                    rewritten.push('\u{feff}');
+                }
+                remaining_data -= 1;
+                if remaining_data == 0 {
+                    rewritten.push_str("data: ");
+                    rewritten.push_str(&serialized);
+                    rewritten.push_str(ending);
+                }
+            } else {
+                rewritten.push_str(line);
+                rewritten.push_str(ending);
+            }
         }
         Some(rewritten)
     }
@@ -543,6 +549,86 @@ mod tests {
             out.push_str(&String::from_utf8_lossy(&item.unwrap()));
         }
         out
+    }
+
+    fn parse_sse_events(output: &str) -> Vec<Value> {
+        let mut decoder = SseDecoder::default();
+        decoder.push(Bytes::copy_from_slice(output.as_bytes()));
+        let mut events = Vec::new();
+        while let Some(frame) = decoder.next_frame() {
+            if let SseFrame::Event(bytes) = frame {
+                let data = sse_data(std::str::from_utf8(&bytes).unwrap()).unwrap();
+                events.push(serde_json::from_str(&data).unwrap());
+            }
+        }
+        assert!(
+            decoder.finish().is_empty(),
+            "SSE must end with a complete event"
+        );
+        events
+    }
+
+    #[tokio::test]
+    async fn stream_rewrites_conflicts_with_all_line_endings_and_chunk_boundaries() {
+        let history: Value = serde_json::from_str(HISTORY).unwrap();
+        for ending in ["\n", "\r\n", "\r"] {
+            let input = TOOL_CONFLICT_SSE.replace('\n', ending);
+            for size in [1, 2, 7, 4096] {
+                let chunks = (0..input.len())
+                    .step_by(size)
+                    .map(|start| &input[start..(start + size).min(input.len())])
+                    .collect();
+                let out = wrapped_output(chunks, &history).await;
+                let events = parse_sse_events(&out);
+                let mut expected = parse_sse_events(&input);
+                let id = events[1]["content_block"]["id"].as_str().unwrap();
+                assert_ne!(id, "toolu_Bash_0");
+                assert!(id.starts_with("toolu_"));
+                expected[1]["content_block"]["id"] = json!(id);
+                assert_eq!(events, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_rewrites_multiline_data_with_mixed_line_endings() {
+        let history: Value = serde_json::from_str(HISTORY).unwrap();
+        for ending in ["\n", "\r\n", "\r"] {
+            for delimiter in ["\n\n", "\r\n\r\n", "\r\r", "\r\n\n", "\n\r"] {
+                let input = format!(
+                    "event: content_block_start{ending}data: {{\"type\":\"content_block_start\",\"index\":0,{ending}id: event-1\r: keep metadata\rdata: \"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_Bash_0\",\"name\":\"Bash\",\"input\":{{\"command\":\"echo toolu_Bash_0\"}}}}}}{delimiter}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                );
+                for size in [1, 7, 4096] {
+                    let chunks: Vec<_> = (0..input.len())
+                        .step_by(size)
+                        .map(|start| &input[start..(start + size).min(input.len())])
+                        .collect();
+                    // 无冲突时，多行载荷和所有元数据必须保持原始字节。
+                    assert_eq!(wrapped_output(chunks.clone(), &json!({})).await, input);
+                    let out = wrapped_output(chunks, &history).await;
+                    assert!(out.contains("id: event-1\r: keep metadata\r"));
+                    assert!(out.contains(&format!("{delimiter}event: message_stop\n")));
+                    let events = parse_sse_events(&out);
+                    let mut expected = parse_sse_events(&input);
+                    let id = events[0]["content_block"]["id"].as_str().unwrap();
+                    assert_ne!(id, "toolu_Bash_0");
+                    expected[0]["content_block"]["id"] = json!(id);
+                    assert_eq!(events, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_sse_block_preserves_bom_and_metadata_matching_payload() {
+        let payload = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_Bash_0","name":"Bash","input":{}}}"#;
+        let block = format!("\u{feff}data: {payload}\r: {payload}\rid: {payload}\r\r");
+        let mut rewriter = rewriter_from_history();
+        let out = rewriter.rewrite_sse_block(&block).unwrap();
+        assert!(out.starts_with("\u{feff}data: "));
+        assert!(out.ends_with(&format!("\r: {payload}\rid: {payload}\r\r")));
+        let event: Value = serde_json::from_str(&sse_data(&out).unwrap()).unwrap();
+        assert_ne!(event["content_block"]["id"], "toolu_Bash_0");
     }
 
     #[tokio::test]
