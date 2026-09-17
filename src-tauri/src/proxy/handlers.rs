@@ -42,6 +42,7 @@ use super::{
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
+    tool_id_compat::ToolIdRewriter,
     types::*,
     usage::parser::TokenUsage,
     ProxyError,
@@ -258,12 +259,21 @@ async fn handle_messages_for_app(
     }
 
     // 通用响应处理（透传模式）
+    // Anthropic 协议直通时启用 tool ID 冲突兼容：收集请求历史中的 tool ID，
+    // 响应侧发现 tool_use ID 与历史冲突（或包内重复）时替换为唯一 ID。
+    // 检测按冲突触发，正常上游零改写、字节级原样透传（详见 tool_id_compat）。
+    let tool_id_rewriter = if needs_transform {
+        None
+    } else {
+        Some(ToolIdRewriter::from_request(&body))
+    };
     process_response(
         response,
         &ctx,
         &state,
         &CLAUDE_PARSER_CONFIG,
         connection_guard,
+        tool_id_rewriter,
     )
     .await
 }
@@ -832,6 +842,7 @@ pub async fn handle_chat_completions(
         &state,
         &OPENAI_PARSER_CONFIG,
         connection_guard,
+        None,
     )
     .await
 }
@@ -965,6 +976,7 @@ async fn handle_responses_for_app(
         &state,
         &CODEX_PARSER_CONFIG,
         connection_guard,
+        None,
     )
     .await
 }
@@ -1067,6 +1079,7 @@ async fn handle_codex_standalone_passthrough(
         &state,
         &CODEX_PARSER_CONFIG,
         connection_guard,
+        None,
     )
     .await
 }
@@ -1186,6 +1199,7 @@ async fn handle_responses_compact_for_app(
         &state,
         &CODEX_PARSER_CONFIG,
         connection_guard,
+        None,
     )
     .await
 }
@@ -1210,8 +1224,15 @@ async fn handle_codex_xai_native_responses_rewrite(
     // restorable function calls; hand them to the generic passthrough so error
     // shape and usage handling stay identical to the untransformed path.
     if !status.is_success() {
-        return process_response(response, ctx, state, &CODEX_PARSER_CONFIG, connection_guard)
-            .await;
+        return process_response(
+            response,
+            ctx,
+            state,
+            &CODEX_PARSER_CONFIG,
+            connection_guard,
+            None,
+        )
+        .await;
     }
 
     if response.is_sse() {
@@ -2199,6 +2220,7 @@ pub async fn handle_gemini(
         &state,
         &GEMINI_PARSER_CONFIG,
         connection_guard,
+        None,
     )
     .await
 }

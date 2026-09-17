@@ -53,6 +53,7 @@ pub mod rsp {
     pub const BUILD_RESPONSE_ERROR: &str = "RSP-003";
     pub const STREAM_TIMEOUT: &str = "RSP-004";
     pub const STREAM_ERROR: &str = "RSP-005";
+    pub const TOOL_ID_REWRITTEN: &str = "RSP-006";
 }
 
 /// 使用量日志码

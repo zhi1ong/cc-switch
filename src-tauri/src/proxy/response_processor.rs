@@ -8,8 +8,10 @@ use super::{
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES},
+    log_codes,
     server::ProxyState,
     sse::{sse_data, SseDecoder, SseFrame},
+    tool_id_compat::ToolIdRewriter,
     usage::parser::TokenUsage,
     ProxyError,
 };
@@ -148,12 +150,14 @@ pub fn is_sse_response(response: &ProxyResponse) -> bool {
 }
 
 /// 处理流式响应
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_streaming(
     response: ProxyResponse,
     ctx: &RequestContext,
     state: &ProxyState,
     parser_config: &UsageParserConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    tool_id_rewriter: Option<ToolIdRewriter>,
 ) -> Response {
     let status = response.status();
     log::debug!(
@@ -179,12 +183,13 @@ pub async fn handle_streaming(
     //   透传——文本改写会把压缩字节转成 U+FFFD 替换字符，造成不可逆损坏；
     // - 回写会改变 SSE 字节数，带 Content-Length 的整包 SSE 会被下游按旧长度
     //   截断/挂起，因此剥掉实体头让 axum 按流式重生成。
+    // tool ID 冲突改写同样会改变 SSE 字节数，实体头一并处理。
     let rewrite_target = if get_content_encoding(response.headers()).is_none() {
         ctx.response_model_rewrite_target()
     } else {
         None
     };
-    if rewrite_target.is_some() {
+    if rewrite_target.is_some() || tool_id_rewriter.is_some() {
         strip_entity_headers_for_rebuilt_body(&mut response_headers);
     }
 
@@ -213,10 +218,19 @@ pub async fn handle_streaming(
         connection_guard,
     );
 
+    // tool ID 冲突兼容（Anthropic 透传，详见 tool_id_compat）：只改写冲突的
+    // content_block_start 事件，其余字节原样；usage 收集在 logged_stream 内
+    // 基于原始事件完成。
+    let tool_id_stream = super::tool_id_compat::wrap_stream_for_tool_id_rewrite(
+        logged_stream,
+        tool_id_rewriter,
+        ctx.tag,
+    );
+
     // usage 收集器在 logged_stream 内部看到的仍是上游回显的真实模型名，
     // 回写只影响发给客户端的字节。
     let final_stream = super::response_model_rewriter::wrap_stream_for_model_rewrite(
-        logged_stream,
+        tool_id_stream,
         rewrite_target,
     );
 
@@ -231,6 +245,7 @@ pub async fn handle_streaming(
 }
 
 /// 处理非流式响应
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_non_streaming(
     response: ProxyResponse,
     ctx: &RequestContext,
@@ -238,6 +253,7 @@ pub async fn handle_non_streaming(
     parser_config: &UsageParserConfig,
     // guard 在函数 scope 内持有，整包响应读取完成后随函数返回一并 drop
     _connection_guard: Option<ActiveConnectionGuard>,
+    mut tool_id_rewriter: Option<ToolIdRewriter>,
 ) -> Result<Response, ProxyError> {
     // 整包超时：仅在故障转移开启且配置值非零时生效
     let body_timeout =
@@ -249,6 +265,22 @@ pub async fn handle_non_streaming(
     let (mut response_headers, status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
     strip_hop_by_hop_response_headers(&mut response_headers);
+
+    // Anthropic 透传：tool ID 冲突兼容改写（详见 tool_id_compat 模块注释）。
+    // 无冲突时保持字节级原样透传；改写后实体头（content-length 等）失真，需重建。
+    let mut body_bytes = body_bytes;
+    if let Some(rewriter) = tool_id_rewriter.as_mut() {
+        if let Some(rewritten) = rewriter.rewrite_buffered(&body_bytes) {
+            log::info!(
+                "[{}] [{}] 检测到 tool_use ID 与历史冲突，已替换 {} 处（上游每轮重置 tool ID 的兼容处理）",
+                ctx.tag,
+                log_codes::rsp::TOOL_ID_REWRITTEN,
+                rewriter.rewrites()
+            );
+            strip_entity_headers_for_rebuilt_body(&mut response_headers);
+            body_bytes = Bytes::from(rewritten);
+        }
+    }
 
     log::debug!(
         "[{}] 上游响应体已接收: bytes={} (content omitted)",
@@ -361,17 +393,35 @@ pub async fn handle_non_streaming(
 /// 通用响应处理入口
 ///
 /// 根据响应类型自动选择流式或非流式处理
+#[allow(clippy::too_many_arguments)]
 pub async fn process_response(
     response: ProxyResponse,
     ctx: &RequestContext,
     state: &ProxyState,
     parser_config: &UsageParserConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    tool_id_rewriter: Option<ToolIdRewriter>,
 ) -> Result<Response, ProxyError> {
     if is_sse_response(&response) {
-        Ok(handle_streaming(response, ctx, state, parser_config, connection_guard).await)
+        Ok(handle_streaming(
+            response,
+            ctx,
+            state,
+            parser_config,
+            connection_guard,
+            tool_id_rewriter,
+        )
+        .await)
     } else {
-        handle_non_streaming(response, ctx, state, parser_config, connection_guard).await
+        handle_non_streaming(
+            response,
+            ctx,
+            state,
+            parser_config,
+            connection_guard,
+            tool_id_rewriter,
+        )
+        .await
     }
 }
 
@@ -898,6 +948,7 @@ mod tests {
     use crate::proxy::sse::strip_sse_field;
     use crate::proxy::types::{ProxyConfig, ProxyStatus};
     use rust_decimal::Decimal;
+    use serde_json::json;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
