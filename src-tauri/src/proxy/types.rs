@@ -225,6 +225,14 @@ pub struct RectifierConfig {
     /// 客户端看到的始终是它请求的名字。usage 记账在回写前完成，不受影响。
     #[serde(default)]
     pub response_model_rewrite: bool,
+    /// 响应整流：tool ID 冲突兼容（默认关闭）
+    ///
+    /// 部分 Anthropic 协议兼容上游（如百炼托管的 kimi-k3）每轮重置
+    /// tool_use ID，响应与历史 ID 冲突时客户端会丢弃重复 ID 的工具
+    /// 结果，模型反复请求同一调用。开启后检测到冲突才把响应里的
+    /// tool_use ID 替换为唯一 ID；正常上游零改写、字节级透传。
+    #[serde(default)]
+    pub response_tool_id_compat: bool,
 }
 
 fn default_true() -> bool {
@@ -244,6 +252,7 @@ impl Default for RectifierConfig {
             request_media_fallback: true,
             request_media_heuristic: true,
             response_model_rewrite: false,
+            response_tool_id_compat: false,
         }
     }
 }
@@ -405,6 +414,10 @@ mod tests {
             !config.response_model_rewrite,
             "响应模型回写默认应为 false（opt-in，按需开启）"
         );
+        assert!(
+            !config.response_tool_id_compat,
+            "tool ID 冲突兼容默认应为 false（需手动开启）"
+        );
     }
 
     #[test]
@@ -426,6 +439,10 @@ mod tests {
         assert!(
             !config.response_model_rewrite,
             "缺 responseModelRewrite 时应回退默认值 false"
+        );
+        assert!(
+            !config.response_tool_id_compat,
+            "缺 responseToolIdCompat 时应回退默认值 false（存量配置默认关闭）"
         );
     }
 
@@ -461,6 +478,15 @@ mod tests {
         assert!(config.enabled);
         assert!(config.request_thinking_signature);
         assert!(config.request_thinking_budget);
+    }
+
+    #[test]
+    fn test_rectifier_config_serde_tool_id_compat_explicit_true() {
+        // 用户主动开启 tool ID 兼容须如实生效
+        let json = r#"{"responseToolIdCompat": true}"#;
+        let config: RectifierConfig = serde_json::from_str(json).unwrap();
+        assert!(config.response_tool_id_compat);
+        assert!(config.enabled);
     }
 
     #[test]

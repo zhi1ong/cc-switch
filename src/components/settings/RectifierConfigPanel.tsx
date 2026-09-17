@@ -18,6 +18,7 @@ export function RectifierConfigPanel() {
     requestMediaFallback: true,
     requestMediaHeuristic: true,
     responseModelRewrite: false,
+    responseToolIdCompat: false,
   });
   const [optimizerConfig, setOptimizerConfig] = useState<OptimizerConfig>({
     enabled: false,
@@ -161,6 +162,21 @@ export function RectifierConfigPanel() {
             disabled={!config.enabled}
             onCheckedChange={(checked) =>
               handleChange({ responseModelRewrite: checked })
+            }
+          />
+        </div>
+        <div className="flex items-center justify-between pl-4">
+          <div className="space-y-0.5">
+            <Label>{t("settings.advanced.rectifier.toolIdCompat")}</Label>
+            <p className="text-xs text-muted-foreground">
+              {t("settings.advanced.rectifier.toolIdCompatDescription")}
+            </p>
+          </div>
+          <Switch
+            checked={config.responseToolIdCompat}
+            disabled={!config.enabled}
+            onCheckedChange={(checked) =>
+              handleChange({ responseToolIdCompat: checked })
             }
           />
         </div>

@@ -414,7 +414,9 @@
         "mediaHeuristic": "純文字模型預判",
         "mediaHeuristicDescription": "傳送前依內建的已確認純文字模型登錄表移除圖片。關閉只會停用代理的登錄表預判；已宣告純文字模型的處理與上游錯誤兜底仍會保留，且不會改變 Codex 模型目錄的能力宣告",
         "modelRewrite": "回應模型名回寫",
-        "modelRewriteDescription": "模型映射後，上游回應回傳的是真實模型名。開啟後把回應中的 model 回寫為用戶端請求的模型名（移除 [1m] 標記），用戶端始終看到它請求的名字；用量統計不受影響"
+        "modelRewriteDescription": "模型映射後，上游回應回傳的是真實模型名。開啟後把回應中的 model 回寫為用戶端請求的模型名（移除 [1m] 標記），用戶端始終看到它請求的名字；用量統計不受影響",
+        "toolIdCompat": "Tool ID 衝突相容",
+        "toolIdCompatDescription": "當 Anthropic 協定上游回傳的 tool_use ID 與對話歷史重複（如 DashScope 託管的 kimi-k3 每輪重置 ID）時，自動替換為唯一 ID，避免用戶端丟棄工具結果導致模型反覆請求同一調用。僅在偵測到衝突時改寫，正常上游位元組級透傳不受影響"
       },
       "optimizer": {
         "title": "Bedrock 請求最佳化工具",

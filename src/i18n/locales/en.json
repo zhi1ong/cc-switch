@@ -414,7 +414,9 @@
         "mediaHeuristic": "Text-Only Model Preflight",
         "mediaHeuristicDescription": "Before sending, strips images for models in the built-in confirmed text-only registry. Turning this off only disables the proxy's registry-based preflight; declared text-only handling and upstream-error fallback remain, and Codex model-catalog capability declarations are unchanged",
         "modelRewrite": "Response Model Rewrite",
-        "modelRewriteDescription": "After model mapping, upstream responses echo the real upstream model name. When enabled, the model field in responses is rewritten to the model name the client requested (the [1m] marker is stripped), so clients always see the name they asked for. Usage accounting is unaffected"
+        "modelRewriteDescription": "After model mapping, upstream responses echo the real upstream model name. When enabled, the model field in responses is rewritten to the model name the client requested (the [1m] marker is stripped), so clients always see the name they asked for. Usage accounting is unaffected",
+        "toolIdCompat": "Tool ID Conflict Compat",
+        "toolIdCompatDescription": "When an Anthropic-protocol upstream returns a tool_use ID that already exists in the conversation history (e.g. DashScope-hosted kimi-k3 restarts IDs every turn), automatically replaces it with a unique ID so clients don't drop the tool result and re-request the same call. Rewrites happen only when a conflict is detected; well-behaved upstreams pass through unchanged"
       },
       "optimizer": {
         "title": "Bedrock Request Optimizer",

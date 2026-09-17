@@ -328,6 +328,7 @@ export interface RectifierConfig {
   requestMediaFallback: boolean;
   requestMediaHeuristic: boolean;
   responseModelRewrite: boolean;
+  responseToolIdCompat: boolean;
 }
 
 export interface OptimizerConfig {

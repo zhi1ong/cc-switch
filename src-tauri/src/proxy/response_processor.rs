@@ -948,7 +948,6 @@ mod tests {
     use crate::proxy::sse::strip_sse_field;
     use crate::proxy::types::{ProxyConfig, ProxyStatus};
     use rust_decimal::Decimal;
-    use serde_json::json;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;

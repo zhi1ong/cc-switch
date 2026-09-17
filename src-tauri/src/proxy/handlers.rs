@@ -259,10 +259,13 @@ async fn handle_messages_for_app(
     }
 
     // 通用响应处理（透传模式）
-    // Anthropic 协议直通时启用 tool ID 冲突兼容：收集请求历史中的 tool ID，
-    // 响应侧发现 tool_use ID 与历史冲突（或包内重复）时替换为唯一 ID。
-    // 检测按冲突触发，正常上游零改写、字节级原样透传（详见 tool_id_compat）。
-    let tool_id_rewriter = if needs_transform {
+    // Anthropic 协议直通且整流器开关开启时启用 tool ID 冲突兼容：收集请求
+    // 历史中的 tool ID，响应侧发现 tool_use ID 与历史冲突（或包内重复）时
+    // 替换为唯一 ID。检测按冲突触发，正常上游零改写、字节级原样透传
+    // （详见 tool_id_compat）。
+    let tool_id_rewriter = if needs_transform
+        || !(ctx.rectifier_config.enabled && ctx.rectifier_config.response_tool_id_compat)
+    {
         None
     } else {
         Some(ToolIdRewriter::from_request(&body))

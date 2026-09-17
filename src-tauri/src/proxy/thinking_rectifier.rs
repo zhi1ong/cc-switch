@@ -254,6 +254,7 @@ mod tests {
             request_media_fallback: true,
             request_media_heuristic: true,
             response_model_rewrite: false,
+            response_tool_id_compat: false,
         }
     }
 
@@ -265,6 +266,7 @@ mod tests {
             request_media_fallback: true,
             request_media_heuristic: true,
             response_model_rewrite: false,
+            response_tool_id_compat: false,
         }
     }
 
@@ -276,6 +278,7 @@ mod tests {
             request_media_fallback: true,
             request_media_heuristic: true,
             response_model_rewrite: false,
+            response_tool_id_compat: false,
         }
     }
 
